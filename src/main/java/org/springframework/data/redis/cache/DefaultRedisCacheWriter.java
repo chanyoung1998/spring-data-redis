@@ -218,33 +218,21 @@ class DefaultRedisCacheWriter implements RedisCacheWriter {
 
 		return execute(name, connection -> {
 
-			if (isLockingCacheWriter()) {
-				doLock(name, key, value, connection);
+			boolean put;
+
+			if (shouldExpireWithin(ttl)) {
+				put = ObjectUtils.nullSafeEquals(
+						connection.stringCommands().set(key, value, Expiration.from(ttl), SetOption.ifAbsent()), true);
+			} else {
+				put = ObjectUtils.nullSafeEquals(connection.stringCommands().setNX(key, value), true);
 			}
 
-			try {
-
-				boolean put;
-
-				if (shouldExpireWithin(ttl)) {
-					put = ObjectUtils.nullSafeEquals(
-							connection.stringCommands().set(key, value, Expiration.from(ttl), SetOption.ifAbsent()), true);
-				} else {
-					put = ObjectUtils.nullSafeEquals(connection.stringCommands().setNX(key, value), true);
-				}
-
-				if (put) {
-					statistics.incPuts(name);
-					return null;
-				}
-
-				return connection.stringCommands().get(key);
-
-			} finally {
-				if (isLockingCacheWriter()) {
-					doUnlock(name, connection);
-				}
+			if (put) {
+				statistics.incPuts(name);
+				return null;
 			}
+
+			return connection.stringCommands().get(key);
 		});
 	}
 
@@ -266,28 +254,14 @@ class DefaultRedisCacheWriter implements RedisCacheWriter {
 
 		execute(name, connection -> {
 
-			boolean wasLocked = false;
+			long deleteCount = batchStrategy.cleanCache(connection, name, pattern);
 
-			try {
-				if (isLockingCacheWriter()) {
-					doLock(name, name, pattern, connection);
-					wasLocked = true;
-				}
-
-				long deleteCount = batchStrategy.cleanCache(connection, name, pattern);
-
-				while (deleteCount > Integer.MAX_VALUE) {
-					statistics.incDeletesBy(name, Integer.MAX_VALUE);
-					deleteCount -= Integer.MAX_VALUE;
-				}
-
-				statistics.incDeletesBy(name, (int) deleteCount);
-
-			} finally {
-				if (wasLocked && isLockingCacheWriter()) {
-					doUnlock(name, connection);
-				}
+			while (deleteCount > Integer.MAX_VALUE) {
+				statistics.incDeletesBy(name, Integer.MAX_VALUE);
+				deleteCount -= Integer.MAX_VALUE;
 			}
+
+			statistics.incDeletesBy(name, (int) deleteCount);
 
 			return "OK";
 		});
@@ -315,7 +289,7 @@ class DefaultRedisCacheWriter implements RedisCacheWriter {
 	 * @param name the name of the cache to lock.
 	 */
 	void lock(String name) {
-		execute(name, connection -> doLock(name, name, null, connection));
+		executeLockFree(connection -> doLock(name, name, null, connection));
 	}
 
 	@Nullable
@@ -344,9 +318,26 @@ class DefaultRedisCacheWriter implements RedisCacheWriter {
 	private <T> T execute(String name, Function<RedisConnection, T> callback) {
 
 		try (RedisConnection connection = this.connectionFactory.getConnection()) {
-			checkAndPotentiallyWaitUntilUnlocked(name, connection);
-			return callback.apply(connection);
+			try {
+				while (!tryLock(name, connection)) {
+					checkAndPotentiallyWaitUntilUnlocked(name, connection);
+				}
+				return callback.apply(connection);
+			} finally {
+				if (isLockingCacheWriter()) {
+					doUnlock(name, connection);
+				}
+			}
 		}
+
+	}
+
+	boolean tryLock(String name, RedisConnection connection) {
+		if (isLockingCacheWriter()) {
+			Expiration expiration = Expiration.from(this.lockTtl.getTimeToLive(name, null));
+			return ObjectUtils.nullSafeEquals(connection.stringCommands().set(createCacheLockKey(name), new byte[0], expiration, SetOption.SET_IF_ABSENT), true);
+		}
+		return true;
 	}
 
 	private <T> T executeLockFree(Function<RedisConnection, T> callback) {
